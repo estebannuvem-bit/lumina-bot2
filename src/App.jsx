@@ -198,7 +198,7 @@ export default function App() {
           <span style={{ fontSize: 20 }}>☁</span>
           <span style={{ fontWeight: 700, fontSize: 16, letterSpacing: "-0.3px" }}>Nuvem</span>
         </div>
-        <a href="https://wa.me/+549XXXXXXXXXX" target="_blank" rel="noreferrer"
+        <a href="https://wa.me/+58 414-0505088" target="_blank" rel="noreferrer"
           style={{ background: "#25d366", color: "white", padding: "8px 18px", borderRadius: 20, fontSize: 13, fontWeight: 600, textDecoration: "none", transition: "opacity 0.2s" }}
           onMouseOver={e => e.target.style.opacity = "0.85"} onMouseOut={e => e.target.style.opacity = "1"}>
           Hablar con Nuvem
@@ -285,7 +285,7 @@ export default function App() {
           <p style={{ color: "rgba(255,255,255,0.45)", fontSize: 16, lineHeight: 1.7, marginBottom: 36 }}>
             Hacemos una demo personalizada con tu rubro y tus leads reales.
           </p>
-          <a href="https://wa.me/+549XXXXXXXXXX?text=Hola, quiero ver cómo funciona la automatización para mi negocio"
+          <a href="https://wa.me/+58 414-0505088?text=Hola, quiero ver cómo funciona la automatización para mi negocio"
             target="_blank" rel="noreferrer"
             style={{ display: "inline-flex", alignItems: "center", gap: 8, background: "#25d366", color: "white", padding: "14px 32px", borderRadius: 30, fontSize: 16, fontWeight: 700, textDecoration: "none", transition: "all 0.2s", boxShadow: "0 8px 32px rgba(37,211,102,0.25)" }}
             onMouseOver={e => e.currentTarget.style.transform = "translateY(-2px)"}
