@@ -1,4 +1,6 @@
-import { kv } from "@vercel/kv";
+import { Redis } from "@upstash/redis";
+
+const redis = Redis.fromEnv();
 
 const SYSTEM_PROMPT = `Eres "Mateo", setter de Nuvem, una agencia de marketing growth. Llegás a esta conversación porque el lead hizo clic en un anuncio y abrió WhatsApp o Instagram.
 
@@ -90,10 +92,7 @@ SEÑALES DE EVENTOS (agregarlas al final de tu mensaje, el lead no las verá):
 - Cuando el lead muestre urgencia alta o quiera hablar ya → agregá al final: [[LEAD_URGENTE]]
 - Cuando el lead no tenga presupuesto o no sea el momento → agregá al final: [[LEAD_DESCALIFICADO]]`;
 
-// Tiempo de expiración del historial: 3 días en segundos
 const HISTORY_TTL = 60 * 60 * 24 * 3;
-
-// Máximo de mensajes a mantener en historial (para controlar tokens)
 const MAX_HISTORY = 20;
 
 function parseEvents(text) {
@@ -125,7 +124,7 @@ export default async function handler(req, res) {
 
   try {
     const historyKey = `history:${contact_id}`;
-    let history = (await kv.get(historyKey)) || [];
+    let history = (await redis.get(historyKey)) || [];
 
     history.push({ role: "user", content: last_input_text });
 
@@ -159,10 +158,10 @@ export default async function handler(req, res) {
     const { clean, event } = parseEvents(raw);
 
     history.push({ role: "assistant", content: clean });
-    await kv.set(historyKey, history, { ex: HISTORY_TTL });
+    await redis.set(historyKey, history, { ex: HISTORY_TTL });
 
     if (event === "descalificado") {
-      await kv.del(historyKey);
+      await redis.del(historyKey);
     }
 
     const response = {
