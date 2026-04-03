@@ -1,12 +1,13 @@
 import { Redis } from "@upstash/redis";
+import { getCatalog } from "./catalog.js";
 
 const redis = Redis.fromEnv();
 
-const HUMAN_TIMEOUT = 10 * 60 * 1000;
-const HISTORY_TTL = 60 * 60 * 24 * 3;
-const MAX_HISTORY = 10;
-const MAX_BOT_MESSAGES = 10;
-const MAX_RETRIES = 3;
+const HUMAN_TIMEOUT    = 10 * 60 * 1000;
+const HISTORY_TTL      = 60 * 60 * 24 * 3;
+const MAX_HISTORY      = 20;
+const MAX_BOT_MESSAGES = 20;
+const MAX_RETRIES      = 3;
 
 // ─── UTILIDADES ───────────────────────────────────────────────
 
@@ -22,6 +23,9 @@ function parseEvents(text) {
   } else if (text.includes("[[LEAD_DESCALIFICADO]]")) {
     clean = text.replace("[[LEAD_DESCALIFICADO]]", "").trim();
     event = "descalificado";
+  } else if (text.includes("[[PEDIDO_LISTO]]")) {
+    clean = text.replace("[[PEDIDO_LISTO]]", "").trim();
+    event = "pedido_listo";
   }
   return { clean, event };
 }
@@ -40,30 +44,51 @@ async function alertSlack(message) {
   }
 }
 
-async function callClaude(system, messages, retries = 0) {
+// ─── LLAMADA A CLAUDE CON PROMPT CACHING ──────────────────────
+
+async function callClaude(systemBase, catalogText, history, retries = 0) {
   try {
+    const messages = [
+      {
+        role: "user",
+        content: `[CATALOGO ACTUALIZADO]\n${catalogText}\n[FIN CATALOGO]\n\nConfirma que recibiste el catalogo.`,
+      },
+      {
+        role: "assistant",
+        content: "Catalogo recibido y listo para consultas.",
+      },
+      ...history,
+    ];
+
     const res = await fetch("https://api.anthropic.com/v1/messages", {
       method: "POST",
       headers: {
         "Content-Type": "application/json",
         "x-api-key": process.env.ANTHROPIC_API_KEY,
         "anthropic-version": "2023-06-01",
+        "anthropic-beta": "prompt-caching-2024-07-31",
       },
       body: JSON.stringify({
         model: "claude-haiku-4-5-20251001",
-        max_tokens: 200,
-        system,
+        max_tokens: 300,
+        system: [
+          {
+            type: "text",
+            text: systemBase,
+            cache_control: { type: "ephemeral" },
+          },
+        ],
         messages,
       }),
     });
+
     const data = await res.json();
     if (!res.ok) throw new Error(data.error?.message || "API error");
     return data.content?.[0]?.text || null;
   } catch (err) {
     if (retries < MAX_RETRIES - 1) {
-      const wait = (retries + 1) * 1000;
-      await new Promise((r) => setTimeout(r, wait));
-      return callClaude(system, messages, retries + 1);
+      await new Promise((r) => setTimeout(r, (retries + 1) * 1000));
+      return callClaude(systemBase, catalogText, history, retries + 1);
     }
     throw err;
   }
@@ -73,7 +98,7 @@ async function callClaude(system, messages, retries = 0) {
 
 async function sendInstagramMessage(recipientId, text) {
   const token = process.env.META_PAGE_ACCESS_TOKEN;
-  const res = await fetch(`https://graph.facebook.com/v19.0/me/messages`, {
+  const res   = await fetch(`https://graph.facebook.com/v19.0/me/messages`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({
@@ -93,10 +118,9 @@ async function sendInstagramMessage(recipientId, text) {
 
 export default async function handler(req, res) {
 
-  // Verificación del webhook de Meta (GET)
   if (req.method === "GET") {
-    const mode = req.query["hub.mode"];
-    const token = req.query["hub.verify_token"];
+    const mode      = req.query["hub.mode"];
+    const token     = req.query["hub.verify_token"];
     const challenge = req.query["hub.challenge"];
     if (mode === "subscribe" && token === process.env.META_VERIFY_TOKEN) {
       return res.status(200).send(challenge);
@@ -108,82 +132,80 @@ export default async function handler(req, res) {
     return res.status(405).json({ error: "Method not allowed" });
   }
 
-  // Obtener clientId desde query param: /api/instagram?client=nuvem
   const clientId = req.query.client || "nuvem";
 
   try {
-    const body = req.body;
-
-    // Meta manda un array de entries
-    const entry = body?.entry?.[0];
+    const body      = req.body;
+    const entry     = body?.entry?.[0];
     const messaging = entry?.messaging?.[0];
 
-    if (!messaging) {
-      return res.status(200).json({ status: "no messaging" });
-    }
+    if (!messaging) return res.status(200).json({ status: "no messaging" });
 
-    const senderId = messaging.sender?.id;
+    const senderId    = messaging.sender?.id;
     const messageText = messaging.message?.text;
 
-    // Ignorar si no es mensaje de texto
     if (!messageText || !senderId) {
       return res.status(200).json({ status: "ignored" });
     }
 
-    // Ignorar mensajes propios (eco)
     if (messaging.message?.is_echo) {
       return res.status(200).json({ status: "echo ignored" });
     }
 
-    const botKey = `bot:${clientId}:${senderId}`;
+    const botKey   = `bot:${clientId}:${senderId}`;
     const humanKey = `last_human:${clientId}:${senderId}`;
 
     // Reactivar bot si pasaron 10 min sin respuesta humana
     const lastHuman = await redis.get(humanKey);
-    if (lastHuman) {
-      const diff = Date.now() - Number(lastHuman);
-      if (diff > HUMAN_TIMEOUT) {
-        await redis.set(botKey, true);
-        await redis.del(humanKey);
-      }
+    if (lastHuman && Date.now() - Number(lastHuman) > HUMAN_TIMEOUT) {
+      await redis.set(botKey, true);
+      await redis.del(humanKey);
     }
 
     const botActive = await redis.get(botKey);
-    if (botActive === false) {
-      return res.status(200).json({ status: "bot paused" });
-    }
+    if (botActive === false) return res.status(200).json({ status: "bot paused" });
 
     const historyKey = `history:${clientId}:${senderId}`;
-    const countKey = `count:${clientId}:${senderId}`;
+    const countKey   = `count:${clientId}:${senderId}`;
 
-    let history = (await redis.get(historyKey)) || [];
-    let botMessageCount = (await redis.get(countKey)) || 0;
+    let history         = (await redis.get(historyKey)) || [];
+    let botMessageCount = (await redis.get(countKey))   || 0;
 
     if (botMessageCount >= MAX_BOT_MESSAGES) {
       return res.status(200).json({ status: "limit reached" });
     }
 
-    // Obtener prompt del cliente desde Redis
+    // Prompt base del cliente
     let systemPrompt = await redis.get(`prompt:${clientId}`);
     if (!systemPrompt) {
       await alertSlack(`⚠️ Cliente *${clientId}* no tiene prompt configurado en Redis.`);
       return res.status(200).json({ status: "no prompt" });
     }
 
-    history.push({ role: "user", content: messageText });
-    if (history.length > MAX_HISTORY) {
-      history = history.slice(-MAX_HISTORY);
+    // Catalogo dinamico
+    const vertical    = await redis.hget(`config:${clientId}`, "vertical") || "muebles";
+    const catalogText = await getCatalog(clientId, vertical);
+
+    if (!catalogText) {
+      systemPrompt += "\n\nIMPORTANTE: El catalogo no esta disponible ahora. Si preguntan precios o productos, avisales que estas actualizando la info y que en breve la tenes.";
+      await alertSlack(`⚠️ Catalogo no disponible para *${clientId}* (vertical: ${vertical})`);
     }
 
-    // Llamar a Claude con reintentos
+    history.push({ role: "user", content: messageText });
+    if (history.length > MAX_HISTORY) history = history.slice(-MAX_HISTORY);
+
     let raw;
     try {
-      raw = await callClaude(systemPrompt, history);
+      raw = await callClaude(
+        systemPrompt,
+        catalogText || "Sin catalogo disponible en este momento.",
+        history
+      );
       if (!raw) throw new Error("Empty response");
     } catch (err) {
       console.error("Claude failed:", err);
-      await alertSlack(`🚨 Claude falló para cliente *${clientId}*, contacto *${senderId}*.`);
-      await sendInstagramMessage(senderId, "perdoná, tuve un problema técnico 😅 escribime en unos minutos");
+      await alertSlack(`🚨 Claude fallo para cliente *${clientId}*, contacto *${senderId}*.`);
+      await sendInstagramMessage(senderId, "perdona, tuve un problema tecnico 😅 escribime en unos minutos");
       return res.status(200).json({ status: "claude error" });
     }
 
@@ -195,6 +217,13 @@ export default async function handler(req, res) {
     await redis.set(historyKey, history, { ex: HISTORY_TTL });
     await redis.set(countKey, botMessageCount, { ex: HISTORY_TTL });
 
+    // Eventos
+    if (event === "pedido_listo") {
+      await alertSlack(`🛒 *PEDIDO LISTO* — Cliente: *${clientId}* | Contacto: ${senderId}`);
+      await redis.set(botKey, false);
+      await redis.set(humanKey, Date.now());
+    }
+
     if (event === "calificado" || event === "urgente" || event === "descalificado") {
       await redis.del(historyKey);
       await redis.del(countKey);
@@ -203,13 +232,12 @@ export default async function handler(req, res) {
       }
     }
 
-    // Enviar respuesta a Instagram
     await sendInstagramMessage(senderId, clean);
-
     return res.status(200).json({ status: "ok" });
+
   } catch (error) {
     console.error("Handler error:", error);
-    await alertSlack(`🚨 Error crítico en instagram webhook: ${error.message}`);
+    await alertSlack(`🚨 Error critico en instagram webhook: ${error.message}`);
     return res.status(200).json({ status: "error" });
   }
 }
