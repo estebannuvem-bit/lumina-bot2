@@ -1,0 +1,218 @@
+import { Redis } from "@upstash/redis";
+import { getCatalog } from "./catalog.js";
+
+const redis = Redis.fromEnv();
+
+const HISTORY_TTL = 60 * 60 * 24 * 3;
+const MAX_HISTORY = 40;
+const MAX_RETRIES = 3;
+const INACTIVITY_RESET = 4 * 60 * 60 * 1000; // 4 horas
+
+// ─── UTILIDADES ───────────────────────────────────────────────
+
+function parseEvents(text) {
+  let clean = text;
+  let event = null;
+  if (text.includes("[[LEAD_CALIFICADO]]")) {
+    clean = text.replace("[[LEAD_CALIFICADO]]", "").trim();
+    event = "calificado";
+  } else if (text.includes("[[LEAD_URGENTE]]")) {
+    clean = text.replace("[[LEAD_URGENTE]]", "").trim();
+    event = "urgente";
+  } else if (text.includes("[[LEAD_DESCALIFICADO]]")) {
+    clean = text.replace("[[LEAD_DESCALIFICADO]]", "").trim();
+    event = "descalificado";
+  } else if (text.includes("[[PEDIDO_LISTO]]")) {
+    clean = text.replace("[[PEDIDO_LISTO]]", "").trim();
+    event = "pedido_listo";
+  }
+  return { clean, event };
+}
+
+async function alertSlack(message) {
+  const url = process.env.SLACK_WEBHOOK_URL;
+  if (!url) return;
+  try {
+    await fetch(url, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ text: message }),
+    });
+  } catch (e) {
+    console.error("Slack alert failed:", e);
+  }
+}
+
+async function callClaude(systemBase, catalogText, history, retries = 0) {
+  try {
+    const messages = [
+      {
+        role: "user",
+        content: `[CATALOGO ACTUALIZADO]\n${catalogText}\n[FIN CATALOGO]\n\nConfirma que recibiste el catalogo.`,
+      },
+      {
+        role: "assistant",
+        content: "Catalogo recibido y listo para consultas.",
+      },
+      ...history,
+    ];
+
+    const res = await fetch("https://api.anthropic.com/v1/messages", {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        "x-api-key": process.env.ANTHROPIC_API_KEY,
+        "anthropic-version": "2023-06-01",
+        "anthropic-beta": "prompt-caching-2024-07-31",
+      },
+      body: JSON.stringify({
+        model: "claude-haiku-4-5-20251001",
+        max_tokens: 400,
+        system: [
+          {
+            type: "text",
+            text: systemBase,
+            cache_control: { type: "ephemeral" },
+          },
+        ],
+        messages,
+      }),
+    });
+
+    const data = await res.json();
+    if (!res.ok) throw new Error(data.error?.message || "API error");
+    return data.content?.[0]?.text || null;
+  } catch (err) {
+    if (retries < MAX_RETRIES - 1) {
+      await new Promise((r) => setTimeout(r, (retries + 1) * 1000));
+      return callClaude(systemBase, catalogText, history, retries + 1);
+    }
+    throw err;
+  }
+}
+
+async function sendWhatsAppMessage(to, text) {
+  const token   = process.env.META_PAGE_ACCESS_TOKEN;
+  const phoneId = process.env.WHATSAPP_PHONE_ID;
+
+  const res = await fetch(`https://graph.facebook.com/v19.0/${phoneId}/messages`, {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      Authorization: `Bearer ${token}`,
+    },
+    body: JSON.stringify({
+      messaging_product: "whatsapp",
+      to,
+      type: "text",
+      text: { body: text },
+    }),
+  });
+
+  if (!res.ok) {
+    const err = await res.json();
+    console.error("WhatsApp send error:", err);
+  }
+}
+
+// ─── HANDLER PRINCIPAL ────────────────────────────────────────
+
+export default async function handler(req, res) {
+  if (req.method !== "POST") {
+    return res.status(405).json({ error: "Method not allowed" });
+  }
+
+  const { clientId, senderId } = req.body;
+  if (!clientId || !senderId) {
+    return res.status(400).json({ error: "Missing params" });
+  }
+
+  try {
+    // Leer y limpiar buffer de mensajes
+    const bufferKey = `buffer:${clientId}:${senderId}`;
+    const buffer    = (await redis.get(bufferKey)) || [];
+    await redis.del(bufferKey);
+
+    if (buffer.length === 0) {
+      return res.status(200).json({ status: "empty buffer" });
+    }
+
+    // Concatenar todos los mensajes del buffer
+    const messageText = buffer.map(m => m.text).join("\n");
+
+    const historyKey     = `history:${clientId}:${senderId}`;
+    const activityKey    = `last_activity:${clientId}:${senderId}`;
+    const botKey         = `bot:${clientId}:${senderId}`;
+    const humanKey       = `last_human:${clientId}:${senderId}`;
+
+    // Resetear historial si estuvo inactivo más de 4 horas
+    const lastActivity = await redis.get(activityKey);
+    if (lastActivity && Date.now() - Number(lastActivity) > INACTIVITY_RESET) {
+      await redis.del(historyKey);
+    }
+    await redis.set(activityKey, Date.now(), { ex: HISTORY_TTL });
+
+    let history = (await redis.get(historyKey)) || [];
+
+    // Prompt base del cliente
+    let systemPrompt = await redis.get(`prompt:${clientId}`);
+    if (!systemPrompt) {
+      await alertSlack(`⚠️ Cliente *${clientId}* no tiene prompt configurado en Redis.`);
+      return res.status(200).json({ status: "no prompt" });
+    }
+
+    // Catalogo dinamico
+    const vertical    = await redis.hget(`config:${clientId}`, "vertical") || "muebles";
+    const catalogText = await getCatalog(clientId, vertical);
+
+    if (!catalogText) {
+      systemPrompt += "\n\nIMPORTANTE: El catalogo no esta disponible ahora. Si preguntan precios o productos, avisales que estas actualizando la info y que en breve la tenes.";
+    }
+
+    history.push({ role: "user", content: messageText });
+    if (history.length > MAX_HISTORY) history = history.slice(-MAX_HISTORY);
+
+    let raw;
+    try {
+      raw = await callClaude(
+        systemPrompt,
+        catalogText || "Sin catalogo disponible.",
+        history
+      );
+      if (!raw) throw new Error("Empty response");
+    } catch (err) {
+      console.error("Claude failed:", err);
+      await alertSlack(`🚨 Claude fallo para cliente *${clientId}*, contacto *${senderId}*.`);
+      await sendWhatsAppMessage(senderId, "Disculpa, tuve un problema tecnico 😅 escribeme en unos minutos");
+      return res.status(200).json({ status: "claude error" });
+    }
+
+    const { clean, event } = parseEvents(raw);
+
+    history.push({ role: "assistant", content: clean });
+    await redis.set(historyKey, history, { ex: HISTORY_TTL });
+
+    // Eventos
+    if (event === "pedido_listo") {
+      await alertSlack(`🛒 *PEDIDO LISTO* — Cliente: *${clientId}* | Contacto: ${senderId}`);
+      await redis.set(botKey, false);
+      await redis.set(humanKey, Date.now());
+    }
+
+    if (event === "calificado" || event === "urgente") {
+      await alertSlack(`🔔 *${event.toUpperCase()}* — Cliente: *${clientId}* | Contacto: ${senderId}`);
+    }
+
+    if (event === "descalificado") {
+      await redis.del(historyKey);
+    }
+
+    await sendWhatsAppMessage(senderId, clean);
+    return res.status(200).json({ status: "ok" });
+
+  } catch (error) {
+    console.error("Process error:", error);
+    await alertSlack(`🚨 Error critico en process: ${error.message}`);
+    return res.status(200).json({ status: "error" });
+  }
+}
