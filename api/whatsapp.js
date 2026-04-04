@@ -4,7 +4,7 @@ const redis = Redis.fromEnv();
 
 const HUMAN_TIMEOUT    = 10 * 60 * 1000;
 const HISTORY_TTL      = 60 * 60 * 24 * 3;
-const DEBOUNCE_SECONDS = 4;
+const DEBOUNCE_SECONDS = 15;
 
 // ─── UTILIDADES ───────────────────────────────────────────────
 
