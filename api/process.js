@@ -3,10 +3,10 @@ import { getCatalog } from "./catalog.js";
 
 const redis = Redis.fromEnv();
 
-const HISTORY_TTL = 60 * 60 * 24 * 3;
-const MAX_HISTORY = 40;
-const MAX_RETRIES = 3;
-const INACTIVITY_RESET = 4 * 60 * 60 * 1000; // 4 horas
+const HISTORY_TTL      = 60 * 60 * 24 * 3;
+const MAX_HISTORY      = 40;
+const MAX_RETRIES      = 3;
+const INACTIVITY_RESET = 4 * 60 * 60 * 1000;
 
 // ─── UTILIDADES ───────────────────────────────────────────────
 
@@ -42,6 +42,25 @@ async function alertSlack(message) {
     console.error("Slack alert failed:", e);
   }
 }
+
+// ─── OBTENER NOMBRE DEL CONTACTO VÍA META ─────────────────────
+
+async function getContactName(senderId) {
+  const token   = process.env.META_PAGE_ACCESS_TOKEN;
+  const phoneId = process.env.WHATSAPP_PHONE_ID;
+  try {
+    const res = await fetch(
+      `https://graph.facebook.com/v19.0/${phoneId}/contacts?fields=profile&filtering=[{"field":"wa_id","operator":"EQUAL","value":"${senderId}"}]`,
+      { headers: { Authorization: `Bearer ${token}` } }
+    );
+    const data = await res.json();
+    return data?.data?.[0]?.profile?.name || null;
+  } catch (e) {
+    return null;
+  }
+}
+
+// ─── LLAMADA A CLAUDE CON PROMPT CACHING ──────────────────────
 
 async function callClaude(systemBase, catalogText, history, retries = 0) {
   try {
@@ -91,6 +110,8 @@ async function callClaude(systemBase, catalogText, history, retries = 0) {
   }
 }
 
+// ─── ENVIAR MENSAJE VÍA WHATSAPP API ──────────────────────────
+
 async function sendWhatsAppMessage(to, text) {
   const token   = process.env.META_PAGE_ACCESS_TOKEN;
   const phoneId = process.env.WHATSAPP_PHONE_ID;
@@ -128,7 +149,7 @@ export default async function handler(req, res) {
   }
 
   try {
-    // Leer y limpiar buffer de mensajes
+    // Leer y limpiar buffer
     const bufferKey = `buffer:${clientId}:${senderId}`;
     const buffer    = (await redis.get(bufferKey)) || [];
     await redis.del(bufferKey);
@@ -137,13 +158,13 @@ export default async function handler(req, res) {
       return res.status(200).json({ status: "empty buffer" });
     }
 
-    // Concatenar todos los mensajes del buffer
     const messageText = buffer.map(m => m.text).join("\n");
 
-    const historyKey     = `history:${clientId}:${senderId}`;
-    const activityKey    = `last_activity:${clientId}:${senderId}`;
-    const botKey         = `bot:${clientId}:${senderId}`;
-    const humanKey       = `last_human:${clientId}:${senderId}`;
+    const historyKey  = `history:${clientId}:${senderId}`;
+    const activityKey = `last_activity:${clientId}:${senderId}`;
+    const nameKey     = `name:${clientId}:${senderId}`;
+    const botKey      = `bot:${clientId}:${senderId}`;
+    const humanKey    = `last_human:${clientId}:${senderId}`;
 
     // Resetear historial si estuvo inactivo más de 4 horas
     const lastActivity = await redis.get(activityKey);
@@ -154,6 +175,15 @@ export default async function handler(req, res) {
 
     let history = (await redis.get(historyKey)) || [];
 
+    // Obtener nombre del contacto (caché en Redis para no consultar siempre)
+    let contactName = await redis.get(nameKey);
+    if (!contactName) {
+      contactName = await getContactName(senderId);
+      if (contactName) {
+        await redis.set(nameKey, contactName, { ex: 60 * 60 * 24 * 30 }); // 30 días
+      }
+    }
+
     // Prompt base del cliente
     let systemPrompt = await redis.get(`prompt:${clientId}`);
     if (!systemPrompt) {
@@ -161,12 +191,19 @@ export default async function handler(req, res) {
       return res.status(200).json({ status: "no prompt" });
     }
 
+    // Inyectar nombre si está disponible
+    if (contactName) {
+      systemPrompt += `\n\nCONTEXTO: El nombre del contacto es ${contactName}. Úsalo en el saludo inicial y ocasionalmente en la conversación de forma natural.`;
+    } else {
+      systemPrompt += `\n\nCONTEXTO: No conoces el nombre del contacto. Pregúntalo de forma natural en el primer mensaje.`;
+    }
+
     // Catalogo dinamico
     const vertical    = await redis.hget(`config:${clientId}`, "vertical") || "muebles";
     const catalogText = await getCatalog(clientId, vertical);
 
     if (!catalogText) {
-      systemPrompt += "\n\nIMPORTANTE: El catalogo no esta disponible ahora. Si preguntan precios o productos, avisales que estas actualizando la info y que en breve la tenes.";
+      systemPrompt += "\n\nIMPORTANTE: El catalogo no esta disponible ahora.";
     }
 
     history.push({ role: "user", content: messageText });
