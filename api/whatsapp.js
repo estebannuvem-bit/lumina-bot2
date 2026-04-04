@@ -25,6 +25,9 @@ async function alertSlack(message) {
 async function scheduleProcessing(clientId, senderId) {
   const token   = process.env.QSTASH_TOKEN;
   const siteUrl = process.env.SITE_URL;
+  const destUrl = `${siteUrl}/api/process`;
+
+  console.log("QStash scheduling to:", destUrl);
 
   // Cancelar job anterior si existe
   const existingJobId = await redis.get(`qstash_job:${clientId}:${senderId}`);
@@ -40,7 +43,7 @@ async function scheduleProcessing(clientId, senderId) {
   }
 
   // Crear nuevo job con delay
-  const res = await fetch("https://qstash.upstash.io/v2/publish/" + encodeURIComponent(`${siteUrl}/api/process`), {
+  const qstashRes = await fetch(`https://qstash.upstash.io/v2/publish/${destUrl}`, {
     method: "POST",
     headers: {
       Authorization: `Bearer ${token}`,
@@ -50,7 +53,9 @@ async function scheduleProcessing(clientId, senderId) {
     body: JSON.stringify({ clientId, senderId }),
   });
 
-  const data = await res.json();
+  const data = await qstashRes.json();
+  console.log("QStash response:", JSON.stringify(data));
+
   if (data.messageId) {
     await redis.set(`qstash_job:${clientId}:${senderId}`, data.messageId, { ex: 30 });
   }
@@ -144,7 +149,7 @@ export default async function handler(req, res) {
     buffer.push({ text: messageText, ts: Date.now() });
     await redis.set(bufferKey, buffer, { ex: 30 });
 
-    // Programar procesamiento con debounce (cancela el anterior si existe)
+    // Programar procesamiento con debounce
     await scheduleProcessing(clientId, senderId);
 
     return res.status(200).json({ status: "queued" });
