@@ -29,11 +29,13 @@ async function scheduleProcessing(clientId, senderId) {
 
   console.log("QStash scheduling to:", destUrl);
 
+  const qstashUrl = process.env.QSTASH_URL || "https://qstash.upstash.io";
+
   // Cancelar job anterior si existe
   const existingJobId = await redis.get(`qstash_job:${clientId}:${senderId}`);
   if (existingJobId) {
     try {
-      await fetch(`https://qstash.upstash.io/v2/messages/${existingJobId}`, {
+      await fetch(`${qstashUrl}/v2/messages/${existingJobId}`, {
         method: "DELETE",
         headers: { Authorization: `Bearer ${token}` },
       });
@@ -43,7 +45,7 @@ async function scheduleProcessing(clientId, senderId) {
   }
 
   // Crear nuevo job con delay
-  const qstashRes = await fetch(`https://qstash.upstash.io/v2/publish/${destUrl}`, {
+  const qstashRes = await fetch(`${qstashUrl}/v2/publish/${destUrl}`, {
     method: "POST",
     headers: {
       Authorization: `Bearer ${token}`,
