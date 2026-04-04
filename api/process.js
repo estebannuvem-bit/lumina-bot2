@@ -45,16 +45,24 @@ async function alertSlack(message) {
 
 // ─── OBTENER NOMBRE DEL CONTACTO VÍA META ─────────────────────
 
-async function getContactName(senderId) {
+async function getContactName(senderId, channel) {
   const token   = process.env.META_PAGE_ACCESS_TOKEN;
   const phoneId = process.env.WHATSAPP_PHONE_ID;
   try {
-    const res = await fetch(
-      `https://graph.facebook.com/v19.0/${phoneId}/contacts?fields=profile&filtering=[{"field":"wa_id","operator":"EQUAL","value":"${senderId}"}]`,
-      { headers: { Authorization: `Bearer ${token}` } }
-    );
-    const data = await res.json();
-    return data?.data?.[0]?.profile?.name || null;
+    if (channel === "instagram") {
+      const res = await fetch(
+        `https://graph.facebook.com/v19.0/${senderId}?fields=name&access_token=${token}`
+      );
+      const data = await res.json();
+      return data?.name || null;
+    } else {
+      const res = await fetch(
+        `https://graph.facebook.com/v19.0/${phoneId}/contacts?fields=profile&filtering=[{"field":"wa_id","operator":"EQUAL","value":"${senderId}"}]`,
+        { headers: { Authorization: `Bearer ${token}` } }
+      );
+      const data = await res.json();
+      return data?.data?.[0]?.profile?.name || null;
+    }
   } catch (e) {
     return null;
   }
@@ -110,29 +118,45 @@ async function callClaude(systemBase, catalogText, history, retries = 0) {
   }
 }
 
-// ─── ENVIAR MENSAJE VÍA WHATSAPP API ──────────────────────────
+// ─── ENVIAR MENSAJE ───────────────────────────────────────────
 
-async function sendWhatsAppMessage(to, text) {
+async function sendMessage(senderId, text, channel) {
   const token   = process.env.META_PAGE_ACCESS_TOKEN;
   const phoneId = process.env.WHATSAPP_PHONE_ID;
 
-  const res = await fetch(`https://graph.facebook.com/v19.0/${phoneId}/messages`, {
-    method: "POST",
-    headers: {
-      "Content-Type": "application/json",
-      Authorization: `Bearer ${token}`,
-    },
-    body: JSON.stringify({
-      messaging_product: "whatsapp",
-      to,
-      type: "text",
-      text: { body: text },
-    }),
-  });
-
-  if (!res.ok) {
-    const err = await res.json();
-    console.error("WhatsApp send error:", err);
+  if (channel === "instagram") {
+    const res = await fetch(`https://graph.facebook.com/v19.0/me/messages`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        recipient: { id: senderId },
+        message: { text },
+        messaging_type: "RESPONSE",
+        access_token: token,
+      }),
+    });
+    if (!res.ok) {
+      const err = await res.json();
+      console.error("Instagram send error:", err);
+    }
+  } else {
+    const res = await fetch(`https://graph.facebook.com/v19.0/${phoneId}/messages`, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        Authorization: `Bearer ${token}`,
+      },
+      body: JSON.stringify({
+        messaging_product: "whatsapp",
+        to: senderId,
+        type: "text",
+        text: { body: text },
+      }),
+    });
+    if (!res.ok) {
+      const err = await res.json();
+      console.error("WhatsApp send error:", err);
+    }
   }
 }
 
@@ -143,7 +167,7 @@ export default async function handler(req, res) {
     return res.status(405).json({ error: "Method not allowed" });
   }
 
-  const { clientId, senderId } = req.body;
+  const { clientId, senderId, channel = "whatsapp" } = req.body;
   if (!clientId || !senderId) {
     return res.status(400).json({ error: "Missing params" });
   }
@@ -159,6 +183,7 @@ export default async function handler(req, res) {
     }
 
     const messageText = buffer.map(m => m.text).join("\n");
+    const msgChannel  = buffer[0]?.channel || channel;
 
     const historyKey  = `history:${clientId}:${senderId}`;
     const activityKey = `last_activity:${clientId}:${senderId}`;
@@ -175,12 +200,12 @@ export default async function handler(req, res) {
 
     let history = (await redis.get(historyKey)) || [];
 
-    // Obtener nombre del contacto (caché en Redis para no consultar siempre)
+    // Obtener nombre del contacto
     let contactName = await redis.get(nameKey);
     if (!contactName) {
-      contactName = await getContactName(senderId);
+      contactName = await getContactName(senderId, msgChannel);
       if (contactName) {
-        await redis.set(nameKey, contactName, { ex: 60 * 60 * 24 * 30 }); // 30 días
+        await redis.set(nameKey, contactName, { ex: 60 * 60 * 24 * 30 });
       }
     }
 
@@ -220,7 +245,7 @@ export default async function handler(req, res) {
     } catch (err) {
       console.error("Claude failed:", err);
       await alertSlack(`🚨 Claude fallo para cliente *${clientId}*, contacto *${senderId}*.`);
-      await sendWhatsAppMessage(senderId, "Disculpa, tuve un problema tecnico 😅 escribeme en unos minutos");
+      await sendMessage(senderId, "Disculpa, tuve un problema tecnico 😅 escribeme en unos minutos", msgChannel);
       return res.status(200).json({ status: "claude error" });
     }
 
@@ -237,14 +262,14 @@ export default async function handler(req, res) {
     }
 
     if (event === "calificado" || event === "urgente") {
-      await alertSlack(`🔔 *${event.toUpperCase()}* — Cliente: *${clientId}* | Contacto: ${senderId}`);
+      await alertSlack(`🔔 *${event.toUpperCase()}* — Cliente: *${clientId}* | Canal: ${msgChannel} | Contacto: ${senderId}`);
     }
 
     if (event === "descalificado") {
       await redis.del(historyKey);
     }
 
-    await sendWhatsAppMessage(senderId, clean);
+    await sendMessage(senderId, clean, msgChannel);
     return res.status(200).json({ status: "ok" });
 
   } catch (error) {
