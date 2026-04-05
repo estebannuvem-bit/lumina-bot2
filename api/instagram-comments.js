@@ -46,7 +46,7 @@ async function getNextReply(clientId, replies) {
 // ─── RESPONDER COMENTARIO PÚBLICAMENTE ────────────────────────
 
 async function replyToComment(commentId, text) {
-  const token = process.env.META_PAGE_ACCESS_TOKEN;
+  const token = process.env.INSTAGRAM_ACCESS_TOKEN;
   const res   = await fetch(`https://graph.facebook.com/v19.0/${commentId}/replies`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
@@ -61,7 +61,7 @@ async function replyToComment(commentId, text) {
 // ─── ENVIAR DM AL USUARIO ─────────────────────────────────────
 
 async function sendDM(recipientId, text) {
-  const token = process.env.META_PAGE_ACCESS_TOKEN;
+  const token = process.env.INSTAGRAM_ACCESS_TOKEN;
   const res   = await fetch(`https://graph.facebook.com/v19.0/me/messages`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
