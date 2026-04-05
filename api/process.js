@@ -131,7 +131,8 @@ async function sendMessage(senderId, text, channel) {
   const phoneId = process.env.WHATSAPP_PHONE_ID;
 
   if (channel === "instagram") {
-    const res = await fetch(`https://graph.facebook.com/v19.0/me/messages`, {
+    const pageId = process.env.INSTAGRAM_PAGE_ID;
+    const res = await fetch(`https://graph.facebook.com/v19.0/${pageId}/messages`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({
