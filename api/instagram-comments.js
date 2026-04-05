@@ -62,7 +62,7 @@ async function replyToComment(commentId, text) {
 
 async function sendDM(recipientId, text) {
   const token = process.env.INSTAGRAM_ACCESS_TOKEN;
-  const res   = await fetch(`https://graph.facebook.com/v19.0/me/messages`, {
+  const res   = await fetch(`https://graph.facebook.com/v19.0/${process.env.INSTAGRAM_PAGE_ID}/messages`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({
