@@ -10,6 +10,12 @@ const INACTIVITY_RESET = 4 * 60 * 60 * 1000;
 
 // ─── UTILIDADES ───────────────────────────────────────────────
 
+function getToken(channel) {
+  return channel === "instagram"
+    ? process.env.INSTAGRAM_ACCESS_TOKEN
+    : process.env.META_PAGE_ACCESS_TOKEN;
+}
+
 function parseEvents(text) {
   let clean = text;
   let event = null;
@@ -43,10 +49,10 @@ async function alertSlack(message) {
   }
 }
 
-// ─── OBTENER NOMBRE DEL CONTACTO VÍA META ─────────────────────
+// ─── OBTENER NOMBRE DEL CONTACTO ──────────────────────────────
 
 async function getContactName(senderId, channel) {
-  const token   = process.env.META_PAGE_ACCESS_TOKEN;
+  const token   = getToken(channel);
   const phoneId = process.env.WHATSAPP_PHONE_ID;
   try {
     if (channel === "instagram") {
@@ -121,7 +127,7 @@ async function callClaude(systemBase, catalogText, history, retries = 0) {
 // ─── ENVIAR MENSAJE ───────────────────────────────────────────
 
 async function sendMessage(senderId, text, channel) {
-  const token   = process.env.META_PAGE_ACCESS_TOKEN;
+  const token   = getToken(channel);
   const phoneId = process.env.WHATSAPP_PHONE_ID;
 
   if (channel === "instagram") {
