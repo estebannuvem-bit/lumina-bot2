@@ -6,6 +6,8 @@ const HUMAN_TIMEOUT    = 10 * 60 * 1000;
 const HISTORY_TTL      = 60 * 60 * 24 * 3;
 const DEBOUNCE_SECONDS = 15;
 
+const DEFAULT_KEYWORDS = ["info", "precio", "servicios", "quiero", "ayuda", "marketing", "agencia", "cotizacion", "cotización", "negocio"];
+
 // ─── UTILIDADES ───────────────────────────────────────────────
 
 async function alertSlack(message) {
@@ -22,11 +24,19 @@ async function alertSlack(message) {
   }
 }
 
+function containsKeyword(text, keywords) {
+  const lower = text.trim().toLowerCase().normalize("NFD").replace(/[\u0300-\u036f]/g, "");
+  return keywords.some(kw => {
+    const normalizedKw = kw.toLowerCase().normalize("NFD").replace(/[\u0300-\u036f]/g, "");
+    return lower === normalizedKw;
+  });
+}
+
 async function scheduleProcessing(clientId, senderId, channel) {
-  const token      = process.env.QSTASH_TOKEN;
-  const qstashUrl  = process.env.QSTASH_URL || "https://qstash.upstash.io";
-  const siteUrl    = process.env.SITE_URL;
-  const destUrl    = `${siteUrl}/api/process`;
+  const token     = process.env.QSTASH_TOKEN;
+  const qstashUrl = process.env.QSTASH_URL || "https://qstash.upstash.io";
+  const siteUrl   = process.env.SITE_URL;
+  const destUrl   = `${siteUrl}/api/process`;
 
   // Cancelar job anterior si existe
   const existingJobId = await redis.get(`qstash_job:${clientId}:${senderId}`);
@@ -87,6 +97,7 @@ export default async function handler(req, res) {
 
     const senderId    = messaging.sender?.id;
     const messageText = messaging.message?.text;
+    const isFromAd    = !!messaging.referral?.source_type;
 
     if (!messageText || !senderId) {
       return res.status(200).json({ status: "ignored" });
@@ -94,6 +105,20 @@ export default async function handler(req, res) {
 
     if (messaging.message?.is_echo) {
       return res.status(200).json({ status: "echo ignored" });
+    }
+
+    // Obtener keywords configuradas para este cliente o usar las default
+    const savedKeywords = await redis.get(`instagram_keywords:${clientId}`);
+    const keywords = savedKeywords
+      ? JSON.parse(savedKeywords)
+      : DEFAULT_KEYWORDS;
+
+    const hasKeyword = containsKeyword(messageText, keywords);
+
+    // Filtro: solo responder si viene de anuncio O contiene palabra clave
+    if (!isFromAd && !hasKeyword) {
+      console.log(`Instagram ignored [${clientId}]: no ad, no keyword — "${messageText}"`);
+      return res.status(200).json({ status: "filtered" });
     }
 
     const botKey   = `bot:${clientId}:${senderId}`;
@@ -109,7 +134,7 @@ export default async function handler(req, res) {
     const botActive = await redis.get(botKey);
     if (botActive === false) return res.status(200).json({ status: "bot paused" });
 
-    // Acumular mensaje en buffer con canal
+    // Acumular mensaje en buffer
     const bufferKey = `buffer:${clientId}:${senderId}`;
     const buffer    = (await redis.get(bufferKey)) || [];
     buffer.push({ text: messageText, ts: Date.now(), channel: "instagram" });
