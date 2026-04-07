@@ -26,65 +26,70 @@ async function supabaseFetch(path, method = "GET", body = null) {
       },
       body: body ? JSON.stringify(body) : null,
     });
-    if (!res.ok) return null;
+    if (!res.ok) {
+      const err = await res.text();
+      console.error("Supabase error:", err);
+      return null;
+    }
     const text = await res.text();
     return text ? JSON.parse(text) : null;
   } catch (e) {
-    console.error("Supabase error:", e.message);
+    console.error("Supabase fetch failed:", e.message);
     return null;
   }
 }
 
-async function upsertConversation(clientId, senderId, channel, contactName, contactPhone, contactInstagram) {
+async function upsertConversation(clientId, senderId, channel, contactName) {
+  // Buscar conversacion existente
   const existing = await supabaseFetch(
-    `/conversations?contact_id=eq.${senderId}&channel=eq.${channel}&limit=1`,
+    `/conversations?client_id=eq.${clientId}&contact_id=eq.${senderId}&channel=eq.${channel}&limit=1`,
     "GET"
   );
+
   if (existing && existing.length > 0) {
     const conv = existing[0];
     await supabaseFetch(`/conversations?id=eq.${conv.id}`, "PATCH", {
-      last_message_at: new Date().toISOString(),
-      unread_count: (conv.unread_count || 0) + 1,
+      last_seen:    new Date().toISOString(),
       contact_name: contactName || conv.contact_name,
     });
     return conv.id;
   }
+
+  // Crear nueva conversacion
   const result = await supabaseFetch("/conversations", "POST", {
-    contact_id:        senderId,
+    client_id:    clientId,
+    contact_id:   senderId,
     channel,
-    contact_name:      contactName || "Desconocido",
-    contact_phone:     contactPhone || null,
-    contact_instagram: contactInstagram || null,
-    last_message_at:   new Date().toISOString(),
-    unread_count:      1,
-    status:            "open",
+    contact_name: contactName || "Desconocido",
+    status:       "open",
+    last_seen:    new Date().toISOString(),
   });
+
   return result?.[0]?.id || null;
 }
 
-async function saveMessage(conversationId, role, content, channel) {
+async function saveMessage(conversationId, clientId, role, content) {
   if (!conversationId) return;
   await supabaseFetch("/messages", "POST", {
     conversation_id: conversationId,
+    client_id:       clientId,
     role,
     content,
-    channel,
-    created_at: new Date().toISOString(),
   });
+  // Actualizar ultimo mensaje en la conversacion
   await supabaseFetch(`/conversations?id=eq.${conversationId}`, "PATCH", {
     last_message: content.slice(0, 120),
+    last_seen:    new Date().toISOString(),
   });
 }
 
-async function saveLead(conversationId, contactName, contactPhone, contactInstagram, channel, status) {
+async function saveLead(clientId, senderId, contactName, channel, status) {
   await supabaseFetch("/leads", "POST", {
-    conversation_id:   conversationId,
-    contact_name:      contactName || "Desconocido",
-    contact_phone:     contactPhone || null,
-    contact_instagram: contactInstagram || null,
+    client_id:    clientId,
+    contact_id:   senderId,
+    contact_name: contactName || "Desconocido",
     channel,
     status,
-    created_at: new Date().toISOString(),
   });
 }
 
@@ -160,10 +165,10 @@ async function callClaude(systemBase, catalogText, history, retries = 0) {
     const res = await fetch("https://api.anthropic.com/v1/messages", {
       method: "POST",
       headers: {
-        "Content-Type":    "application/json",
-        "x-api-key":       process.env.ANTHROPIC_API_KEY,
+        "Content-Type":      "application/json",
+        "x-api-key":         process.env.ANTHROPIC_API_KEY,
         "anthropic-version": "2023-06-01",
-        "anthropic-beta":  "prompt-caching-2024-07-31",
+        "anthropic-beta":    "prompt-caching-2024-07-31",
       },
       body: JSON.stringify({
         model:      "claude-haiku-4-5-20251001",
@@ -253,15 +258,9 @@ export default async function handler(req, res) {
       if (contactName) await redis.set(nameKey, contactName, { ex: 60 * 60 * 24 * 30 });
     }
 
-    const contactPhone     = msgChannel === "whatsapp"  ? senderId : null;
-    const contactInstagram = msgChannel === "instagram" ? senderId : null;
-
     // SUPABASE: guardar conversacion y mensaje del usuario
-    const conversationId = await upsertConversation(
-      clientId, senderId, msgChannel,
-      contactName, contactPhone, contactInstagram
-    );
-    await saveMessage(conversationId, "user", messageText, msgChannel);
+    const conversationId = await upsertConversation(clientId, senderId, msgChannel, contactName);
+    await saveMessage(conversationId, clientId, "user", messageText);
 
     let systemPrompt = await redis.get(`prompt:${clientId}`);
     if (!systemPrompt) {
@@ -299,7 +298,7 @@ export default async function handler(req, res) {
     await redis.set(historyKey, history, { ex: HISTORY_TTL });
 
     // SUPABASE: guardar respuesta del bot
-    await saveMessage(conversationId, "assistant", clean, msgChannel);
+    await saveMessage(conversationId, clientId, "assistant", clean);
 
     if (event === "pedido_listo") {
       await alertSlack(`🛒 *PEDIDO LISTO* — Cliente: *${clientId}* | Contacto: ${senderId}`);
@@ -309,14 +308,16 @@ export default async function handler(req, res) {
 
     if (event === "calificado" || event === "urgente") {
       await alertSlack(`🔔 *${event.toUpperCase()}* — Cliente: *${clientId}* | Canal: ${msgChannel} | Contacto: ${senderId}`);
-      // SUPABASE: guardar lead calificado
-      await saveLead(conversationId, contactName, contactPhone, contactInstagram, msgChannel, "contacted");
+      await saveLead(clientId, senderId, contactName, msgChannel, event);
     }
 
     if (event === "descalificado") {
       await redis.del(historyKey);
-      // SUPABASE: guardar lead perdido
-      await saveLead(conversationId, contactName, contactPhone, contactInstagram, msgChannel, "lost");
+      await saveLead(clientId, senderId, contactName, msgChannel, "descalificado");
+    }
+
+    if (event === "pedido_listo") {
+      await saveLead(clientId, senderId, contactName, msgChannel, "pedido_listo");
     }
 
     await sendMessage(senderId, clean, msgChannel);
