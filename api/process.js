@@ -60,7 +60,7 @@ async function upsertConversation(clientId, senderId, channel, contactName) {
     client_id:    clientId,
     contact_id:   senderId,
     channel,
-    contact_name: contactName || "Desconocido",
+    contact_name: contactName || senderId,
     status:       "open",
     last_seen:    new Date().toISOString(),
   });
@@ -87,7 +87,7 @@ async function saveLead(clientId, senderId, contactName, channel, status) {
   await supabaseFetch("/leads", "POST", {
     client_id:    clientId,
     contact_id:   senderId,
-    contact_name: contactName || "Desconocido",
+    contact_name: contactName || senderId,
     channel,
     status,
   });
