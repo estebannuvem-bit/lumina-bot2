@@ -8,6 +8,86 @@ const MAX_HISTORY      = 40;
 const MAX_RETRIES      = 3;
 const INACTIVITY_RESET = 4 * 60 * 60 * 1000;
 
+// ─── SUPABASE ─────────────────────────────────────────────────
+
+const SUPABASE_URL = process.env.SUPABASE_URL;
+const SUPABASE_KEY = process.env.SUPABASE_SERVICE_ROLE_KEY;
+
+async function supabaseFetch(path, method = "GET", body = null) {
+  if (!SUPABASE_URL || !SUPABASE_KEY) return null;
+  try {
+    const res = await fetch(`${SUPABASE_URL}/rest/v1${path}`, {
+      method,
+      headers: {
+        "Content-Type":  "application/json",
+        "apikey":         SUPABASE_KEY,
+        "Authorization": `Bearer ${SUPABASE_KEY}`,
+        "Prefer":        method === "POST" ? "return=representation" : "",
+      },
+      body: body ? JSON.stringify(body) : null,
+    });
+    if (!res.ok) return null;
+    const text = await res.text();
+    return text ? JSON.parse(text) : null;
+  } catch (e) {
+    console.error("Supabase error:", e.message);
+    return null;
+  }
+}
+
+async function upsertConversation(clientId, senderId, channel, contactName, contactPhone, contactInstagram) {
+  const existing = await supabaseFetch(
+    `/conversations?contact_id=eq.${senderId}&channel=eq.${channel}&limit=1`,
+    "GET"
+  );
+  if (existing && existing.length > 0) {
+    const conv = existing[0];
+    await supabaseFetch(`/conversations?id=eq.${conv.id}`, "PATCH", {
+      last_message_at: new Date().toISOString(),
+      unread_count: (conv.unread_count || 0) + 1,
+      contact_name: contactName || conv.contact_name,
+    });
+    return conv.id;
+  }
+  const result = await supabaseFetch("/conversations", "POST", {
+    contact_id:        senderId,
+    channel,
+    contact_name:      contactName || "Desconocido",
+    contact_phone:     contactPhone || null,
+    contact_instagram: contactInstagram || null,
+    last_message_at:   new Date().toISOString(),
+    unread_count:      1,
+    status:            "open",
+  });
+  return result?.[0]?.id || null;
+}
+
+async function saveMessage(conversationId, role, content, channel) {
+  if (!conversationId) return;
+  await supabaseFetch("/messages", "POST", {
+    conversation_id: conversationId,
+    role,
+    content,
+    channel,
+    created_at: new Date().toISOString(),
+  });
+  await supabaseFetch(`/conversations?id=eq.${conversationId}`, "PATCH", {
+    last_message: content.slice(0, 120),
+  });
+}
+
+async function saveLead(conversationId, contactName, contactPhone, contactInstagram, channel, status) {
+  await supabaseFetch("/leads", "POST", {
+    conversation_id:   conversationId,
+    contact_name:      contactName || "Desconocido",
+    contact_phone:     contactPhone || null,
+    contact_instagram: contactInstagram || null,
+    channel,
+    status,
+    created_at: new Date().toISOString(),
+  });
+}
+
 // ─── UTILIDADES ───────────────────────────────────────────────
 
 function getToken(channel) {
@@ -49,20 +129,16 @@ async function alertSlack(message) {
   }
 }
 
-// ─── OBTENER NOMBRE DEL CONTACTO ──────────────────────────────
-
 async function getContactName(senderId, channel) {
   const token   = getToken(channel);
   const phoneId = process.env.WHATSAPP_PHONE_ID;
   try {
     if (channel === "instagram") {
-      const res = await fetch(
-        `https://graph.facebook.com/v19.0/${senderId}?fields=name&access_token=${token}`
-      );
+      const res  = await fetch(`https://graph.facebook.com/v19.0/${senderId}?fields=name&access_token=${token}`);
       const data = await res.json();
       return data?.name || null;
     } else {
-      const res = await fetch(
+      const res  = await fetch(
         `https://graph.facebook.com/v19.0/${phoneId}/contacts?fields=profile&filtering=[{"field":"wa_id","operator":"EQUAL","value":"${senderId}"}]`,
         { headers: { Authorization: `Bearer ${token}` } }
       );
@@ -74,44 +150,28 @@ async function getContactName(senderId, channel) {
   }
 }
 
-// ─── LLAMADA A CLAUDE CON PROMPT CACHING ──────────────────────
-
 async function callClaude(systemBase, catalogText, history, retries = 0) {
   try {
     const messages = [
-      {
-        role: "user",
-        content: `[CATALOGO ACTUALIZADO]\n${catalogText}\n[FIN CATALOGO]\n\nConfirma que recibiste el catalogo.`,
-      },
-      {
-        role: "assistant",
-        content: "Catalogo recibido y listo para consultas.",
-      },
+      { role: "user",      content: `[CATALOGO ACTUALIZADO]\n${catalogText}\n[FIN CATALOGO]\n\nConfirma que recibiste el catalogo.` },
+      { role: "assistant", content: "Catalogo recibido y listo para consultas." },
       ...history,
     ];
-
     const res = await fetch("https://api.anthropic.com/v1/messages", {
       method: "POST",
       headers: {
-        "Content-Type": "application/json",
-        "x-api-key": process.env.ANTHROPIC_API_KEY,
+        "Content-Type":    "application/json",
+        "x-api-key":       process.env.ANTHROPIC_API_KEY,
         "anthropic-version": "2023-06-01",
-        "anthropic-beta": "prompt-caching-2024-07-31",
+        "anthropic-beta":  "prompt-caching-2024-07-31",
       },
       body: JSON.stringify({
-        model: "claude-haiku-4-5-20251001",
+        model:      "claude-haiku-4-5-20251001",
         max_tokens: 400,
-        system: [
-          {
-            type: "text",
-            text: systemBase,
-            cache_control: { type: "ephemeral" },
-          },
-        ],
+        system: [{ type: "text", text: systemBase, cache_control: { type: "ephemeral" } }],
         messages,
       }),
     });
-
     const data = await res.json();
     if (!res.ok) throw new Error(data.error?.message || "API error");
     return data.content?.[0]?.text || null;
@@ -124,12 +184,9 @@ async function callClaude(systemBase, catalogText, history, retries = 0) {
   }
 }
 
-// ─── ENVIAR MENSAJE ───────────────────────────────────────────
-
 async function sendMessage(senderId, text, channel) {
   const token   = getToken(channel);
   const phoneId = process.env.WHATSAPP_PHONE_ID;
-
   if (channel === "instagram") {
     const igAccountId = process.env.INSTAGRAM_ACCOUNT_ID;
     const res = await fetch(`https://graph.facebook.com/v19.0/${igAccountId}/messages`, {
@@ -142,17 +199,11 @@ async function sendMessage(senderId, text, channel) {
         access_token: token,
       }),
     });
-    if (!res.ok) {
-      const err = await res.json();
-      console.error("Instagram send error:", err);
-    }
+    if (!res.ok) console.error("Instagram send error:", await res.json());
   } else {
     const res = await fetch(`https://graph.facebook.com/v19.0/${phoneId}/messages`, {
       method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-        Authorization: `Bearer ${token}`,
-      },
+      headers: { "Content-Type": "application/json", Authorization: `Bearer ${token}` },
       body: JSON.stringify({
         messaging_product: "whatsapp",
         to: senderId,
@@ -160,34 +211,24 @@ async function sendMessage(senderId, text, channel) {
         text: { body: text },
       }),
     });
-    if (!res.ok) {
-      const err = await res.json();
-      console.error("WhatsApp send error:", err);
-    }
+    if (!res.ok) console.error("WhatsApp send error:", await res.json());
   }
 }
 
 // ─── HANDLER PRINCIPAL ────────────────────────────────────────
 
 export default async function handler(req, res) {
-  if (req.method !== "POST") {
-    return res.status(405).json({ error: "Method not allowed" });
-  }
+  if (req.method !== "POST") return res.status(405).json({ error: "Method not allowed" });
 
   const { clientId, senderId, channel = "whatsapp" } = req.body;
-  if (!clientId || !senderId) {
-    return res.status(400).json({ error: "Missing params" });
-  }
+  if (!clientId || !senderId) return res.status(400).json({ error: "Missing params" });
 
   try {
-    // Leer y limpiar buffer
     const bufferKey = `buffer:${clientId}:${senderId}`;
     const buffer    = (await redis.get(bufferKey)) || [];
     await redis.del(bufferKey);
 
-    if (buffer.length === 0) {
-      return res.status(200).json({ status: "empty buffer" });
-    }
+    if (buffer.length === 0) return res.status(200).json({ status: "empty buffer" });
 
     const messageText = buffer.map(m => m.text).join("\n");
     const msgChannel  = buffer[0]?.channel || channel;
@@ -198,7 +239,6 @@ export default async function handler(req, res) {
     const botKey      = `bot:${clientId}:${senderId}`;
     const humanKey    = `last_human:${clientId}:${senderId}`;
 
-    // Resetear historial si estuvo inactivo más de 4 horas
     const lastActivity = await redis.get(activityKey);
     if (lastActivity && Date.now() - Number(lastActivity) > INACTIVITY_RESET) {
       await redis.del(historyKey);
@@ -207,47 +247,44 @@ export default async function handler(req, res) {
 
     let history = (await redis.get(historyKey)) || [];
 
-    // Obtener nombre del contacto
     let contactName = await redis.get(nameKey);
     if (!contactName) {
       contactName = await getContactName(senderId, msgChannel);
-      if (contactName) {
-        await redis.set(nameKey, contactName, { ex: 60 * 60 * 24 * 30 });
-      }
+      if (contactName) await redis.set(nameKey, contactName, { ex: 60 * 60 * 24 * 30 });
     }
 
-    // Prompt base del cliente
+    const contactPhone     = msgChannel === "whatsapp"  ? senderId : null;
+    const contactInstagram = msgChannel === "instagram" ? senderId : null;
+
+    // SUPABASE: guardar conversacion y mensaje del usuario
+    const conversationId = await upsertConversation(
+      clientId, senderId, msgChannel,
+      contactName, contactPhone, contactInstagram
+    );
+    await saveMessage(conversationId, "user", messageText, msgChannel);
+
     let systemPrompt = await redis.get(`prompt:${clientId}`);
     if (!systemPrompt) {
       await alertSlack(`⚠️ Cliente *${clientId}* no tiene prompt configurado en Redis.`);
       return res.status(200).json({ status: "no prompt" });
     }
 
-    // Inyectar nombre si está disponible
     if (contactName) {
       systemPrompt += `\n\nCONTEXTO: El nombre del contacto es ${contactName}. Úsalo en el saludo inicial y ocasionalmente en la conversación de forma natural.`;
     } else {
       systemPrompt += `\n\nCONTEXTO: No conoces el nombre del contacto. Pregúntalo de forma natural en el primer mensaje.`;
     }
 
-    // Catalogo dinamico
     const vertical    = await redis.hget(`config:${clientId}`, "vertical") || "muebles";
     const catalogText = await getCatalog(clientId, vertical);
-
-    if (!catalogText) {
-      systemPrompt += "\n\nIMPORTANTE: El catalogo no esta disponible ahora.";
-    }
+    if (!catalogText) systemPrompt += "\n\nIMPORTANTE: El catalogo no esta disponible ahora.";
 
     history.push({ role: "user", content: messageText });
     if (history.length > MAX_HISTORY) history = history.slice(-MAX_HISTORY);
 
     let raw;
     try {
-      raw = await callClaude(
-        systemPrompt,
-        catalogText || "Sin catalogo disponible.",
-        history
-      );
+      raw = await callClaude(systemPrompt, catalogText || "Sin catalogo disponible.", history);
       if (!raw) throw new Error("Empty response");
     } catch (err) {
       console.error("Claude failed:", err);
@@ -261,7 +298,9 @@ export default async function handler(req, res) {
     history.push({ role: "assistant", content: clean });
     await redis.set(historyKey, history, { ex: HISTORY_TTL });
 
-    // Eventos
+    // SUPABASE: guardar respuesta del bot
+    await saveMessage(conversationId, "assistant", clean, msgChannel);
+
     if (event === "pedido_listo") {
       await alertSlack(`🛒 *PEDIDO LISTO* — Cliente: *${clientId}* | Contacto: ${senderId}`);
       await redis.set(botKey, false);
@@ -270,10 +309,14 @@ export default async function handler(req, res) {
 
     if (event === "calificado" || event === "urgente") {
       await alertSlack(`🔔 *${event.toUpperCase()}* — Cliente: *${clientId}* | Canal: ${msgChannel} | Contacto: ${senderId}`);
+      // SUPABASE: guardar lead calificado
+      await saveLead(conversationId, contactName, contactPhone, contactInstagram, msgChannel, "contacted");
     }
 
     if (event === "descalificado") {
       await redis.del(historyKey);
+      // SUPABASE: guardar lead perdido
+      await saveLead(conversationId, contactName, contactPhone, contactInstagram, msgChannel, "lost");
     }
 
     await sendMessage(senderId, clean, msgChannel);
