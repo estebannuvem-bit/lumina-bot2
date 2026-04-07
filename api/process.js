@@ -39,8 +39,37 @@ async function supabaseFetch(path, method = "GET", body = null) {
   }
 }
 
+// Verifica si el cliente superó el límite mensual
+async function checkMonthlyLimit(clientId) {
+  const firstOfMonth = new Date();
+  firstOfMonth.setDate(1);
+  firstOfMonth.setHours(0, 0, 0, 0);
+
+  // Obtener límite del cliente
+  const clients = await supabaseFetch(`/clients?client_id=eq.${clientId}&select=monthly_limit`, "GET");
+  const limit = clients?.[0]?.monthly_limit ?? 1000;
+
+  // Contar mensajes del bot este mes
+  const msgs = await supabaseFetch(
+    `/messages?client_id=eq.${clientId}&role=eq.assistant&created_at=gte.${firstOfMonth.toISOString()}&select=id`,
+    "GET"
+  );
+  const used = msgs?.length ?? 0;
+
+  console.log(`[${clientId}] Mensajes usados este mes: ${used}/${limit}`);
+  return { limit, used, exceeded: used >= limit };
+}
+
+// Verifica si la conversación está en modo humano
+async function isHumanMode(senderId, channel) {
+  const conv = await supabaseFetch(
+    `/conversations?contact_id=eq.${senderId}&channel=eq.${channel}&select=human_mode&limit=1`,
+    "GET"
+  );
+  return conv?.[0]?.human_mode === true;
+}
+
 async function upsertConversation(clientId, senderId, channel, contactName) {
-  // Buscar conversacion existente
   const existing = await supabaseFetch(
     `/conversations?client_id=eq.${clientId}&contact_id=eq.${senderId}&channel=eq.${channel}&limit=1`,
     "GET"
@@ -55,13 +84,13 @@ async function upsertConversation(clientId, senderId, channel, contactName) {
     return conv.id;
   }
 
-  // Crear nueva conversacion
   const result = await supabaseFetch("/conversations", "POST", {
     client_id:    clientId,
     contact_id:   senderId,
     channel,
     contact_name: contactName || senderId,
     status:       "open",
+    human_mode:   false,
     last_seen:    new Date().toISOString(),
   });
 
@@ -76,7 +105,6 @@ async function saveMessage(conversationId, clientId, role, content) {
     role,
     content,
   });
-  // Actualizar ultimo mensaje en la conversacion
   await supabaseFetch(`/conversations?id=eq.${conversationId}`, "PATCH", {
     last_message: content.slice(0, 120),
     last_seen:    new Date().toISOString(),
@@ -261,6 +289,21 @@ export default async function handler(req, res) {
     // SUPABASE: guardar conversacion y mensaje del usuario
     const conversationId = await upsertConversation(clientId, senderId, msgChannel, contactName);
     await saveMessage(conversationId, clientId, "user", messageText);
+
+    // ── VERIFICAR MODO HUMANO ──
+    const humanMode = await isHumanMode(senderId, msgChannel);
+    if (humanMode) {
+      console.log(`[${clientId}] Conversación en modo humano para ${senderId} — bot silenciado`);
+      return res.status(200).json({ status: "human_mode" });
+    }
+
+    // ── VERIFICAR LÍMITE MENSUAL ──
+    const { exceeded, used, limit } = await checkMonthlyLimit(clientId);
+    if (exceeded) {
+      console.log(`[${clientId}] Límite mensual alcanzado (${used}/${limit}) — bot silenciado`);
+      await alertSlack(`⚠️ *${clientId}* alcanzó el límite mensual de ${limit} mensajes.`);
+      return res.status(200).json({ status: "limit_exceeded" });
+    }
 
     let systemPrompt = await redis.get(`prompt:${clientId}`);
     if (!systemPrompt) {
