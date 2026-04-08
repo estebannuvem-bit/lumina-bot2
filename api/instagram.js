@@ -61,13 +61,15 @@ async function scheduleProcessing(clientId, senderId, channel) {
   }
 }
 
-// ─── RESPONDER COMENTARIO DIRECTAMENTE ────────────────────────
-// Esto usa instagram_business_manage_comments y registra la llamada
+async function replyToComment(commentId, replyText, clientId) {
+  // Evitar responder dos veces al mismo comentario
+  const alreadyReplied = await redis.get(`comment_replied:${commentId}`);
+  if (alreadyReplied) {
+    console.log(`Comment ${commentId} already replied, skipping`);
+    return;
+  }
 
-async function replyToComment(commentId, replyText) {
   const token = process.env.INSTAGRAM_ACCESS_TOKEN;
-  console.log(`Replying to comment ${commentId} using instagram_business_manage_comments`);
-
   const res = await fetch(`https://graph.facebook.com/v19.0/${commentId}/replies`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
@@ -81,9 +83,10 @@ async function replyToComment(commentId, replyText) {
   if (!res.ok) {
     console.error("Comment reply error:", JSON.stringify(data));
   } else {
-    console.log("Comment reply sent successfully:", data.id);
+    console.log("Comment reply sent:", data.id);
+    // Marcar como respondido por 24 horas para evitar loops
+    await redis.set(`comment_replied:${commentId}`, true, { ex: 60 * 60 * 24 });
   }
-  return data;
 }
 
 export default async function handler(req, res) {
@@ -108,23 +111,32 @@ export default async function handler(req, res) {
     const body  = req.body;
     const entry = body?.entry?.[0];
 
-    console.log("Instagram webhook payload:", JSON.stringify(body));
-
     // ── COMENTARIOS ───────────────────────────────────────────
     const changes = entry?.changes;
     if (changes && changes.length > 0) {
       for (const change of changes) {
-        console.log(`Change field: ${change.field}`, JSON.stringify(change.value));
-
-        if (change.field === "comments" || change.field === "mention") {
+        if (change.field === "comments") {
           const value       = change.value;
           const commentId   = value?.id;
-          const commentText = value?.text || value?.comment_text || "";
+          const commentText = value?.text || "";
           const senderId    = value?.from?.id;
+          const igAccountId = process.env.INSTAGRAM_ACCOUNT_ID;
+
+          // CRÍTICO: ignorar si el comentario es de nuestra propia cuenta (evita loop)
+          if (value?.from?.id === igAccountId) {
+            console.log("Own comment ignored — loop prevention");
+            continue;
+          }
+
+          // CRÍTICO: ignorar si es un reply (parent_id existe)
+          if (value?.parent_id) {
+            console.log("Reply comment ignored — loop prevention");
+            continue;
+          }
 
           console.log(`Comment [${clientId}]: id=${commentId} from=${senderId} text="${commentText}"`);
 
-          if (!commentId || !commentText) continue;
+          if (!commentId || !commentText || !senderId) continue;
 
           const savedKeywords = await redis.get(`instagram_keywords:${clientId}`);
           const keywords = savedKeywords ? JSON.parse(savedKeywords) : DEFAULT_KEYWORDS;
@@ -132,22 +144,18 @@ export default async function handler(req, res) {
 
           if (!hasKeyword) {
             console.log(`Comment ignored: no keyword — "${commentText}"`);
-            // Igual registrar la llamada respondiendo con un reply genérico
-            await replyToComment(commentId, "¡Gracias por tu comentario! 😊 Te enviamos un mensaje privado.");
             continue;
           }
 
           // Responder al comentario (registra la llamada del permiso)
-          await replyToComment(commentId, "¡Hola! Te enviamos un mensaje privado ahora 📩");
+          await replyToComment(commentId, "¡Hola! Te enviamos un mensaje privado ahora 📩", clientId);
 
-          // También encolar para respuesta por DM si hay senderId
-          if (senderId) {
-            const bufferKey = `buffer:${clientId}:${senderId}`;
-            const buffer    = (await redis.get(bufferKey)) || [];
-            buffer.push({ text: commentText, ts: Date.now(), channel: "instagram" });
-            await redis.set(bufferKey, buffer, { ex: 60 });
-            await scheduleProcessing(clientId, senderId, "instagram");
-          }
+          // Encolar para respuesta por DM
+          const bufferKey = `buffer:${clientId}:${senderId}`;
+          const buffer    = (await redis.get(bufferKey)) || [];
+          buffer.push({ text: commentText, ts: Date.now(), channel: "instagram" });
+          await redis.set(bufferKey, buffer, { ex: 60 });
+          await scheduleProcessing(clientId, senderId, "instagram");
         }
       }
       return res.status(200).json({ status: "comments processed" });
