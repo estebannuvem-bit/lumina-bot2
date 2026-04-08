@@ -3,7 +3,6 @@ import { Redis } from "@upstash/redis";
 const redis = Redis.fromEnv();
 
 const HUMAN_TIMEOUT    = 10 * 60 * 1000;
-const HISTORY_TTL      = 60 * 60 * 24 * 3;
 const DEBOUNCE_SECONDS = 15;
 
 const DEFAULT_KEYWORDS = ["info", "precio", "servicios", "quiero", "ayuda", "marketing", "agencia", "cotizacion", "cotización", "negocio"];
@@ -38,7 +37,6 @@ async function scheduleProcessing(clientId, senderId, channel) {
   const siteUrl   = process.env.SITE_URL;
   const destUrl   = `${siteUrl}/api/process`;
 
-  // Cancelar job anterior si existe
   const existingJobId = await redis.get(`qstash_job:${clientId}:${senderId}`);
   if (existingJobId) {
     try {
@@ -46,12 +44,9 @@ async function scheduleProcessing(clientId, senderId, channel) {
         method: "DELETE",
         headers: { Authorization: `Bearer ${token}` },
       });
-    } catch (e) {
-      // Si ya se ejecutó no importa
-    }
+    } catch (e) {}
   }
 
-  // Crear nuevo job con delay
   const qstashRes = await fetch(`${qstashUrl}/v2/publish/${destUrl}`, {
     method: "POST",
     headers: {
@@ -66,6 +61,21 @@ async function scheduleProcessing(clientId, senderId, channel) {
   if (data.messageId) {
     await redis.set(`qstash_job:${clientId}:${senderId}`, data.messageId, { ex: 60 });
   }
+}
+
+// ─── RESPONDER COMENTARIO CON DM ──────────────────────────────
+
+async function replyToCommentWithDM(senderId, commentText, clientId) {
+  const token       = process.env.INSTAGRAM_ACCESS_TOKEN;
+  const igAccountId = process.env.INSTAGRAM_ACCOUNT_ID;
+
+  // Acumular en buffer para procesar con Claude
+  const bufferKey = `buffer:${clientId}:${senderId}`;
+  const buffer    = (await redis.get(bufferKey)) || [];
+  buffer.push({ text: commentText, ts: Date.now(), channel: "instagram" });
+  await redis.set(bufferKey, buffer, { ex: 60 });
+
+  await scheduleProcessing(clientId, senderId, "instagram");
 }
 
 // ─── HANDLER PRINCIPAL ────────────────────────────────────────
@@ -89,11 +99,49 @@ export default async function handler(req, res) {
   const clientId = req.query.client || "nuvem";
 
   try {
-    const body      = req.body;
-    const entry     = body?.entry?.[0];
+    const body  = req.body;
+    const entry = body?.entry?.[0];
+
+    // ── COMENTARIOS (instagram_business_manage_comments) ──────
+    const changes = entry?.changes;
+    if (changes && changes.length > 0) {
+      for (const change of changes) {
+        if (change.field === "comments" || change.field === "mention") {
+          const value      = change.value;
+          const commentId  = value?.id;
+          const commentText = value?.text || value?.comment_text || "";
+          const senderId   = value?.from?.id;
+
+          console.log(`Instagram comment received [${clientId}]: "${commentText}" from ${senderId}`);
+
+          if (!senderId || !commentText) continue;
+
+          // Verificar keywords
+          const savedKeywords = await redis.get(`instagram_keywords:${clientId}`);
+          const keywords = savedKeywords ? JSON.parse(savedKeywords) : DEFAULT_KEYWORDS;
+          const hasKeyword = containsKeyword(commentText, keywords);
+
+          if (!hasKeyword) {
+            console.log(`Comment ignored [${clientId}]: no keyword — "${commentText}"`);
+            continue;
+          }
+
+          // Verificar modo humano
+          const botKey  = `bot:${clientId}:${senderId}`;
+          const botActive = await redis.get(botKey);
+          if (botActive === false) continue;
+
+          // Procesar comentario — enviar DM al usuario
+          await replyToCommentWithDM(senderId, commentText, clientId);
+        }
+      }
+      return res.status(200).json({ status: "comments processed" });
+    }
+
+    // ── MENSAJES DM (instagram_business_manage_messages) ──────
     const messaging = entry?.messaging?.[0];
 
-    if (!messaging) return res.status(200).json({ status: "no messaging" });
+    if (!messaging) return res.status(200).json({ status: "no event" });
 
     const senderId    = messaging.sender?.id;
     const messageText = messaging.message?.text;
@@ -107,24 +155,18 @@ export default async function handler(req, res) {
       return res.status(200).json({ status: "echo ignored" });
     }
 
-    // Obtener keywords configuradas para este cliente o usar las default
     const savedKeywords = await redis.get(`instagram_keywords:${clientId}`);
-    const keywords = savedKeywords
-      ? JSON.parse(savedKeywords)
-      : DEFAULT_KEYWORDS;
-
+    const keywords = savedKeywords ? JSON.parse(savedKeywords) : DEFAULT_KEYWORDS;
     const hasKeyword = containsKeyword(messageText, keywords);
 
-    // Filtro: solo responder si viene de anuncio O contiene palabra clave
     if (!isFromAd && !hasKeyword) {
-      console.log(`Instagram ignored [${clientId}]: no ad, no keyword — "${messageText}"`);
+      console.log(`Instagram DM ignored [${clientId}]: no ad, no keyword — "${messageText}"`);
       return res.status(200).json({ status: "filtered" });
     }
 
     const botKey   = `bot:${clientId}:${senderId}`;
     const humanKey = `last_human:${clientId}:${senderId}`;
 
-    // Reactivar bot si pasaron 10 min sin respuesta humana
     const lastHuman = await redis.get(humanKey);
     if (lastHuman && Date.now() - Number(lastHuman) > HUMAN_TIMEOUT) {
       await redis.set(botKey, true);
@@ -134,13 +176,11 @@ export default async function handler(req, res) {
     const botActive = await redis.get(botKey);
     if (botActive === false) return res.status(200).json({ status: "bot paused" });
 
-    // Acumular mensaje en buffer
     const bufferKey = `buffer:${clientId}:${senderId}`;
     const buffer    = (await redis.get(bufferKey)) || [];
     buffer.push({ text: messageText, ts: Date.now(), channel: "instagram" });
     await redis.set(bufferKey, buffer, { ex: 60 });
 
-    // Programar procesamiento con debounce
     await scheduleProcessing(clientId, senderId, "instagram");
 
     return res.status(200).json({ status: "queued" });
