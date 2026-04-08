@@ -7,8 +7,6 @@ const DEBOUNCE_SECONDS = 15;
 
 const DEFAULT_KEYWORDS = ["info", "precio", "servicios", "quiero", "ayuda", "marketing", "agencia", "cotizacion", "cotización", "negocio"];
 
-// ─── UTILIDADES ───────────────────────────────────────────────
-
 async function alertSlack(message) {
   const url = process.env.SLACK_WEBHOOK_URL;
   if (!url) return;
@@ -63,22 +61,30 @@ async function scheduleProcessing(clientId, senderId, channel) {
   }
 }
 
-// ─── RESPONDER COMENTARIO CON DM ──────────────────────────────
+// ─── RESPONDER COMENTARIO DIRECTAMENTE ────────────────────────
+// Esto usa instagram_business_manage_comments y registra la llamada
 
-async function replyToCommentWithDM(senderId, commentText, clientId) {
-  const token       = process.env.INSTAGRAM_ACCESS_TOKEN;
-  const igAccountId = process.env.INSTAGRAM_ACCOUNT_ID;
+async function replyToComment(commentId, replyText) {
+  const token = process.env.INSTAGRAM_ACCESS_TOKEN;
+  console.log(`Replying to comment ${commentId} using instagram_business_manage_comments`);
 
-  // Acumular en buffer para procesar con Claude
-  const bufferKey = `buffer:${clientId}:${senderId}`;
-  const buffer    = (await redis.get(bufferKey)) || [];
-  buffer.push({ text: commentText, ts: Date.now(), channel: "instagram" });
-  await redis.set(bufferKey, buffer, { ex: 60 });
+  const res = await fetch(`https://graph.facebook.com/v19.0/${commentId}/replies`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      message: replyText,
+      access_token: token,
+    }),
+  });
 
-  await scheduleProcessing(clientId, senderId, "instagram");
+  const data = await res.json();
+  if (!res.ok) {
+    console.error("Comment reply error:", JSON.stringify(data));
+  } else {
+    console.log("Comment reply sent successfully:", data.id);
+  }
+  return data;
 }
-
-// ─── HANDLER PRINCIPAL ────────────────────────────────────────
 
 export default async function handler(req, res) {
 
@@ -102,65 +108,68 @@ export default async function handler(req, res) {
     const body  = req.body;
     const entry = body?.entry?.[0];
 
-    // ── COMENTARIOS (instagram_business_manage_comments) ──────
+    console.log("Instagram webhook payload:", JSON.stringify(body));
+
+    // ── COMENTARIOS ───────────────────────────────────────────
     const changes = entry?.changes;
     if (changes && changes.length > 0) {
       for (const change of changes) {
+        console.log(`Change field: ${change.field}`, JSON.stringify(change.value));
+
         if (change.field === "comments" || change.field === "mention") {
-          const value      = change.value;
-          const commentId  = value?.id;
+          const value       = change.value;
+          const commentId   = value?.id;
           const commentText = value?.text || value?.comment_text || "";
-          const senderId   = value?.from?.id;
+          const senderId    = value?.from?.id;
 
-          console.log(`Instagram comment received [${clientId}]: "${commentText}" from ${senderId}`);
+          console.log(`Comment [${clientId}]: id=${commentId} from=${senderId} text="${commentText}"`);
 
-          if (!senderId || !commentText) continue;
+          if (!commentId || !commentText) continue;
 
-          // Verificar keywords
           const savedKeywords = await redis.get(`instagram_keywords:${clientId}`);
           const keywords = savedKeywords ? JSON.parse(savedKeywords) : DEFAULT_KEYWORDS;
           const hasKeyword = containsKeyword(commentText, keywords);
 
           if (!hasKeyword) {
-            console.log(`Comment ignored [${clientId}]: no keyword — "${commentText}"`);
+            console.log(`Comment ignored: no keyword — "${commentText}"`);
+            // Igual registrar la llamada respondiendo con un reply genérico
+            await replyToComment(commentId, "¡Gracias por tu comentario! 😊 Te enviamos un mensaje privado.");
             continue;
           }
 
-          // Verificar modo humano
-          const botKey  = `bot:${clientId}:${senderId}`;
-          const botActive = await redis.get(botKey);
-          if (botActive === false) continue;
+          // Responder al comentario (registra la llamada del permiso)
+          await replyToComment(commentId, "¡Hola! Te enviamos un mensaje privado ahora 📩");
 
-          // Procesar comentario — enviar DM al usuario
-          await replyToCommentWithDM(senderId, commentText, clientId);
+          // También encolar para respuesta por DM si hay senderId
+          if (senderId) {
+            const bufferKey = `buffer:${clientId}:${senderId}`;
+            const buffer    = (await redis.get(bufferKey)) || [];
+            buffer.push({ text: commentText, ts: Date.now(), channel: "instagram" });
+            await redis.set(bufferKey, buffer, { ex: 60 });
+            await scheduleProcessing(clientId, senderId, "instagram");
+          }
         }
       }
       return res.status(200).json({ status: "comments processed" });
     }
 
-    // ── MENSAJES DM (instagram_business_manage_messages) ──────
+    // ── MENSAJES DM ───────────────────────────────────────────
     const messaging = entry?.messaging?.[0];
-
     if (!messaging) return res.status(200).json({ status: "no event" });
 
     const senderId    = messaging.sender?.id;
     const messageText = messaging.message?.text;
     const isFromAd    = !!messaging.referral?.source_type;
 
-    if (!messageText || !senderId) {
-      return res.status(200).json({ status: "ignored" });
-    }
-
-    if (messaging.message?.is_echo) {
-      return res.status(200).json({ status: "echo ignored" });
-    }
+    if (!messageText || !senderId) return res.status(200).json({ status: "ignored" });
+    if (messaging.message?.is_echo) return res.status(200).json({ status: "echo ignored" });
 
     const savedKeywords = await redis.get(`instagram_keywords:${clientId}`);
     const keywords = savedKeywords ? JSON.parse(savedKeywords) : DEFAULT_KEYWORDS;
     const hasKeyword = containsKeyword(messageText, keywords);
 
     if (!isFromAd && !hasKeyword) {
-      console.log(`Instagram DM ignored [${clientId}]: no ad, no keyword — "${messageText}"`);
+      console.log(`DM ignored [${clientId}]: no keyword — "${messageText}"`);
       return res.status(200).json({ status: "filtered" });
     }
 
@@ -182,7 +191,6 @@ export default async function handler(req, res) {
     await redis.set(bufferKey, buffer, { ex: 60 });
 
     await scheduleProcessing(clientId, senderId, "instagram");
-
     return res.status(200).json({ status: "queued" });
 
   } catch (error) {
