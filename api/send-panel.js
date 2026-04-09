@@ -7,17 +7,25 @@ const SUPABASE_URL = process.env.SUPABASE_URL;
 const SUPABASE_KEY = process.env.SUPABASE_SERVICE_ROLE_KEY;
 
 async function saveMessageToSupabase(clientId, senderId, role, content) {
-  if (!SUPABASE_URL || !SUPABASE_KEY) return;
+  if (!SUPABASE_URL || !SUPABASE_KEY) {
+    console.error("Missing Supabase credentials");
+    return;
+  }
   try {
     const convRes = await fetch(
       `${SUPABASE_URL}/rest/v1/conversations?client_id=eq.${clientId}&contact_id=eq.${senderId}&channel=eq.whatsapp&limit=1`,
       { headers: { "apikey": SUPABASE_KEY, "Authorization": `Bearer ${SUPABASE_KEY}` } }
     );
     const convData = await convRes.json();
-    const conversationId = convData?.[0]?.id;
-    if (!conversationId) return;
+    console.log(`Supabase conv search for client=${clientId} contact=${senderId}:`, JSON.stringify(convData));
 
-    await fetch(`${SUPABASE_URL}/rest/v1/messages`, {
+    const conversationId = convData?.[0]?.id;
+    if (!conversationId) {
+      console.error(`No conversation found for client=${clientId} contact=${senderId}`);
+      return;
+    }
+
+    const msgRes = await fetch(`${SUPABASE_URL}/rest/v1/messages`, {
       method: "POST",
       headers: {
         "Content-Type":  "application/json",
@@ -33,6 +41,8 @@ async function saveMessageToSupabase(clientId, senderId, role, content) {
         type: "text",
       }),
     });
+
+    console.log(`Message saved to Supabase, status: ${msgRes.status}`);
 
     await fetch(`${SUPABASE_URL}/rest/v1/conversations?id=eq.${conversationId}`, {
       method: "PATCH",
