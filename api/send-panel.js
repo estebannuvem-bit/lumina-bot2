@@ -1,7 +1,4 @@
 // api/send-panel.js
-// Endpoint para enviar mensajes desde el panel NUVIs
-// Soporta múltiples clientes usando sus propias credenciales en Redis
-
 import { Redis } from "@upstash/redis";
 
 const redis = Redis.fromEnv();
@@ -12,7 +9,6 @@ const SUPABASE_KEY = process.env.SUPABASE_SERVICE_ROLE_KEY;
 async function saveMessageToSupabase(clientId, senderId, role, content) {
   if (!SUPABASE_URL || !SUPABASE_KEY) return;
   try {
-    // Buscar conversacion
     const convRes = await fetch(
       `${SUPABASE_URL}/rest/v1/conversations?client_id=eq.${clientId}&contact_id=eq.${senderId}&channel=eq.whatsapp&limit=1`,
       { headers: { "apikey": SUPABASE_KEY, "Authorization": `Bearer ${SUPABASE_KEY}` } }
@@ -21,7 +17,6 @@ async function saveMessageToSupabase(clientId, senderId, role, content) {
     const conversationId = convData?.[0]?.id;
     if (!conversationId) return;
 
-    // Guardar mensaje
     await fetch(`${SUPABASE_URL}/rest/v1/messages`, {
       method: "POST",
       headers: {
@@ -39,7 +34,6 @@ async function saveMessageToSupabase(clientId, senderId, role, content) {
       }),
     });
 
-    // Actualizar ultimo mensaje
     await fetch(`${SUPABASE_URL}/rest/v1/conversations?id=eq.${conversationId}`, {
       method: "PATCH",
       headers: {
@@ -69,17 +63,19 @@ export default async function handler(req, res) {
   }
 
   try {
-    // Obtener credenciales del cliente desde Redis
-    // Cada cliente tiene sus propias credenciales guardadas en Redis
-    const waToken   = await redis.get(`config:${clientId}:wa_token`)   || process.env.META_PAGE_ACCESS_TOKEN;
-    const waPhoneId = await redis.get(`config:${clientId}:wa_phone_id`) || process.env.WHATSAPP_PHONE_ID;
-    const igToken   = await redis.get(`config:${clientId}:ig_token`)   || process.env.INSTAGRAM_ACCESS_TOKEN;
+    const waToken   = await redis.get(`config:${clientId}:wa_token`)      || process.env.META_PAGE_ACCESS_TOKEN;
+    const waPhoneId = await redis.get(`config:${clientId}:wa_phone_id`)   || process.env.WHATSAPP_PHONE_ID;
+    const igToken   = await redis.get(`config:${clientId}:ig_token`)      || process.env.INSTAGRAM_ACCESS_TOKEN;
     const igAccId   = await redis.get(`config:${clientId}:ig_account_id`) || process.env.INSTAGRAM_ACCOUNT_ID;
+
+    console.log(`[${clientId}] Send to: ${to} via ${channel}`);
+    console.log(`[${clientId}] phoneId: ${waPhoneId}, token starts: ${waToken?.slice(0, 20)}`);
 
     let sendRes;
 
     if (channel === "whatsapp") {
       if (!waToken || !waPhoneId) {
+        console.error(`[${clientId}] Missing WhatsApp credentials`);
         return res.status(400).json({ error: "WhatsApp credentials not configured for this client" });
       }
 
@@ -118,16 +114,16 @@ export default async function handler(req, res) {
     }
 
     const data = await sendRes.json();
+    console.log(`[${clientId}] WhatsApp API response:`, JSON.stringify(data));
 
     if (!sendRes.ok) {
-      console.error("Send error:", JSON.stringify(data));
+      console.error(`[${clientId}] Send failed:`, JSON.stringify(data));
       return res.status(400).json({ error: data });
     }
 
-    // Guardar mensaje en Supabase como "human" (enviado por el agente)
     await saveMessageToSupabase(clientId, to, "human", message);
 
-    console.log(`[${clientId}] Panel message sent to ${to} via ${channel}`);
+    console.log(`[${clientId}] Panel message sent successfully to ${to}`);
     return res.status(200).json({ status: "sent", messageId: data.messages?.[0]?.id });
 
   } catch (error) {
