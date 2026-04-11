@@ -91,8 +91,6 @@ async function saveMessageToSupabase(clientId, senderId, conversationId, role, c
         client_id:       clientId,
         role,
         content,
-        type,
-        media_url: mediaUrl,
       }),
     });
 
@@ -208,9 +206,17 @@ export default async function handler(req, res) {
     const entry   = body?.entry?.[0];
     const changes = entry?.changes?.[0];
     const value   = changes?.value;
-    const message = value?.messages?.[0];
+    // Ignorar status updates (delivery, read receipts)
+if (value?.statuses) return res.status(200).json({ status: "status ignored" });
 
-    if (!message) return res.status(200).json({ status: "no message" });
+const message = value?.messages?.[0];
+
+if (!message) return res.status(200).json({ status: "no message" });
+
+// Ignorar mensajes enviados por el bot (type: sent)
+if (value?.messaging_product === "whatsapp" && !message.from) {
+  return res.status(200).json({ status: "outbound ignored" });
+}
 
     const senderId    = message.from;
     const messageType = message.type;
