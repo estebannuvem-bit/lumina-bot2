@@ -38,7 +38,6 @@ async function saveMessageToSupabase(clientId, senderId, role, content) {
         client_id:       clientId,
         role,
         content,
-        type: "text",
       }),
     });
 
