@@ -6,7 +6,7 @@ const redis = Redis.fromEnv();
 const HISTORY_TTL      = 60 * 60 * 24 * 3;
 const MAX_HISTORY      = 40;
 const MAX_RETRIES      = 3;
-const INACTIVITY_RESET = 4 * 60 * 60 * 1000;
+const INACTIVITY_RESET = 24 * 60 * 60 * 1000;
 
 // ─── SUPABASE ─────────────────────────────────────────────────
 
