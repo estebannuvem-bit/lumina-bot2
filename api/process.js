@@ -288,7 +288,6 @@ export default async function handler(req, res) {
 
     // SUPABASE: guardar conversacion y mensaje del usuario
     const conversationId = await upsertConversation(clientId, senderId, msgChannel, contactName);
-    await saveMessage(conversationId, clientId, "user", messageText);
 
     // ── VERIFICAR MODO HUMANO ──
     const humanMode = await isHumanMode(senderId, msgChannel);
